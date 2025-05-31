@@ -4,7 +4,395 @@ import pandas_ta as ta
 import json
 import re
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
+import numpy as np
+from typing import Dict, List, Optional
+import anthropic
+
+class TradingLearningSystem:
+    """
+    A learning system that tracks trading signal performance and provides
+    feedback to improve future predictions.
+    """
+    
+    def __init__(self, signals_file='signals_claude_log.json', performance_file='signal_claude_performance.json'):
+        self.signals_file = signals_file
+        self.performance_file = performance_file
+        self.performance_data = self.load_performance_data()
+    
+    def load_performance_data(self) -> List[Dict]:
+        """Load existing performance data"""
+        try:
+            with open(self.performance_file, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+    
+    def save_performance_data(self):
+        """Save performance data to file"""
+        with open(self.performance_file, 'w') as f:
+            json.dump(self.performance_data, f, indent=2)
+    
+    def fetch_historical_price(self, symbol: str, timestamp: str) -> Optional[float]:
+        """
+        Fetch historical price for a given symbol and timestamp
+        """
+        try:
+            # Convert timestamp to milliseconds
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            timestamp_ms = int(dt.timestamp() * 1000)
+            
+            url = 'https://api.binance.com/api/v3/klines'
+            params = {
+                'symbol': symbol,
+                'interval': '1h',
+                'startTime': timestamp_ms,
+                'limit': 1
+            }
+            response = requests.get(url, params=params)
+            data = response.json()
+            
+            if data:
+                return float(data[0][4])  # Close price
+            return None
+        except Exception as e:
+            print(f"Error fetching historical price: {e}")
+            return None
+    
+    def evaluate_signal_performance(self, signal_data: Dict) -> Dict:
+        """
+        Evaluate the performance of a past signal by checking current price
+        against the signal's predictions.
+        """
+        symbol = signal_data.get('symbol')
+        signal_type = signal_data.get('Signal')
+        entry_price = signal_data.get('Entry Price')
+        stop_loss = signal_data.get('Stop Loss')
+        take_profit = signal_data.get('Take Profit Targets', [])
+        timestamp = signal_data.get('timestamp')
+        confidence = signal_data.get('Confidence', 50)
+        
+        if not all([symbol, signal_type, timestamp]):
+            return {'status': 'insufficient_data'}
+        
+        # Skip Hold signals for performance evaluation
+        if signal_type.lower() == 'hold':
+            return {'status': 'hold_signal', 'outcome': 'neutral'}
+        
+        # Get current price
+        try:
+            current_price = self.get_current_price(symbol)
+            if not current_price:
+                return {'status': 'price_fetch_error'}
+        except:
+            return {'status': 'price_fetch_error'}
+        
+        # Convert string prices to float if needed
+        try:
+            if isinstance(entry_price, str) and entry_price != 'N/A':
+                entry_price = float(entry_price.replace('$', '').replace(',', ''))
+            if isinstance(stop_loss, str) and stop_loss != 'N/A':
+                stop_loss = float(stop_loss.replace('$', '').replace(',', ''))
+            if isinstance(take_profit, list) and take_profit:
+                take_profit = [float(str(tp).replace('$', '').replace(',', '')) for tp in take_profit if str(tp) != 'N/A']
+        except (ValueError, AttributeError):
+            return {'status': 'price_conversion_error'}
+        
+        if entry_price == 'N/A' or not isinstance(entry_price, (int, float)):
+            return {'status': 'invalid_entry_price'}
+        
+        # Calculate performance
+        price_change_pct = ((current_price - entry_price) / entry_price) * 100
+        
+        outcome = 'neutral'
+        profit_loss_pct = 0
+        hit_target = False
+        hit_stop = False
+        
+        if signal_type.lower() == 'buy':
+            if take_profit and current_price >= min(take_profit):
+                outcome = 'win'
+                hit_target = True
+                profit_loss_pct = ((min(take_profit) - entry_price) / entry_price) * 100
+            elif stop_loss != 'N/A' and isinstance(stop_loss, (int, float)) and current_price <= stop_loss:
+                outcome = 'loss'
+                hit_stop = True
+                profit_loss_pct = ((stop_loss - entry_price) / entry_price) * 100
+            else:
+                outcome = 'open' if abs(price_change_pct) < 2 else ('winning' if price_change_pct > 0 else 'losing')
+                profit_loss_pct = price_change_pct
+        
+        elif signal_type.lower() == 'sell':
+            if take_profit and current_price <= max(take_profit):
+                outcome = 'win'
+                hit_target = True
+                profit_loss_pct = ((entry_price - max(take_profit)) / entry_price) * 100
+            elif stop_loss != 'N/A' and isinstance(stop_loss, (int, float)) and current_price >= stop_loss:
+                outcome = 'loss'
+                hit_stop = True
+                profit_loss_pct = ((entry_price - stop_loss) / entry_price) * 100
+            else:
+                outcome = 'open' if abs(price_change_pct) < 2 else ('winning' if price_change_pct < 0 else 'losing')
+                profit_loss_pct = -price_change_pct
+        
+        return {
+            'status': 'evaluated',
+            'outcome': outcome,
+            'profit_loss_pct': round(profit_loss_pct, 2),
+            'price_change_pct': round(price_change_pct, 2),
+            'current_price': current_price,
+            'entry_price': entry_price,
+            'hit_target': hit_target,
+            'hit_stop': hit_stop,
+            'confidence': confidence,
+            'evaluation_timestamp': datetime.utcnow().isoformat()
+        }
+    
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price for a symbol"""
+        try:
+            url = f'https://api.binance.com/api/v3/ticker/price'
+            params = {'symbol': symbol}
+            response = requests.get(url, params=params)
+            data = response.json()
+            return float(data['price'])
+        except:
+            return None
+    
+    def update_signal_performance(self):
+        """
+        Update performance data for all signals in the signals log
+        """
+        try:
+            with open(self.signals_file, 'r') as f:
+                signals = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("No signals file found or invalid format")
+            return
+        
+        updated_count = 0
+        for signal in signals:
+            signal_id = f"{signal.get('symbol')}_{signal.get('timestamp')}"
+            
+            # Check if already evaluated recently (within last hour)
+            existing_perf = next((p for p in self.performance_data if p.get('signal_id') == signal_id), None)
+            if existing_perf:
+                last_eval = existing_perf.get('evaluation_timestamp')
+                if last_eval:
+                    try:
+                        last_eval_dt = datetime.fromisoformat(last_eval)
+                        if datetime.utcnow() - last_eval_dt < timedelta(hours=1):
+                            continue  # Skip recent evaluations
+                    except:
+                        pass
+            
+            performance = self.evaluate_signal_performance(signal)
+            if performance.get('status') == 'evaluated':
+                performance['signal_id'] = signal_id
+                performance['original_signal'] = signal
+                
+                # Update existing or add new
+                if existing_perf:
+                    existing_perf.update(performance)
+                else:
+                    self.performance_data.append(performance)
+                
+                updated_count += 1
+        
+        self.save_performance_data()
+        print(f"Updated performance for {updated_count} signals")
+    
+    def get_performance_statistics(self) -> Dict:
+        """
+        Calculate performance statistics from historical signals
+        """
+        if not self.performance_data:
+            return {}
+        
+        evaluated_signals = [p for p in self.performance_data if p.get('status') == 'evaluated']
+        if not evaluated_signals:
+            return {}
+        
+        wins = [p for p in evaluated_signals if p.get('outcome') in ['win', 'winning']]
+        losses = [p for p in evaluated_signals if p.get('outcome') in ['loss', 'losing']]
+        
+        total_signals = len(evaluated_signals)
+        win_rate = (len(wins) / total_signals) * 100 if total_signals > 0 else 0
+        
+        avg_win = np.mean([p.get('profit_loss_pct', 0) for p in wins]) if wins else 0
+        avg_loss = np.mean([p.get('profit_loss_pct', 0) for p in losses]) if losses else 0
+        
+        # Performance by confidence level - FIX: Convert confidence to int/float
+        def safe_confidence(p):
+            conf = p.get('confidence', 50)
+            try:
+                return float(conf) if conf != 'N/A' else 50
+            except (ValueError, TypeError):
+                return 50
+        
+        high_conf = [p for p in evaluated_signals if safe_confidence(p) >= 80]
+        med_conf = [p for p in evaluated_signals if 60 <= safe_confidence(p) < 80]
+        low_conf = [p for p in evaluated_signals if safe_confidence(p) < 60]
+        
+        return {
+            'total_signals': total_signals,
+            'win_rate': round(win_rate, 2),
+            'average_win': round(avg_win, 2),
+            'average_loss': round(avg_loss, 2),
+            'profit_factor': round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 0,
+            'high_confidence_signals': len(high_conf),
+            'high_conf_win_rate': round((len([p for p in high_conf if p.get('outcome') in ['win', 'winning']]) / len(high_conf)) * 100, 2) if high_conf else 0,
+            'medium_confidence_signals': len(med_conf),
+            'med_conf_win_rate': round((len([p for p in med_conf if p.get('outcome') in ['win', 'winning']]) / len(med_conf)) * 100, 2) if med_conf else 0,
+            'low_confidence_signals': len(low_conf),
+            'low_conf_win_rate': round((len([p for p in low_conf if p.get('outcome') in ['win', 'winning']]) / len(low_conf)) * 100, 2) if low_conf else 0
+        }
+    
+    def generate_learning_prompt_addition(self) -> str:
+        """
+        Generate additional prompt text based on past performance to improve future signals
+        """
+        stats = self.get_performance_statistics()
+        if not stats:
+            return ""
+        
+        recent_signals = sorted(self.performance_data, key=lambda x: x.get('evaluation_timestamp', ''), reverse=True)[:10]
+        
+        learning_insights = []
+        
+        # Win rate analysis
+        if stats['win_rate'] < 50:
+            learning_insights.append("CRITICAL: Recent win rate is below 50%. Increase signal selectivity and require stronger confluences.")
+        elif stats['win_rate'] > 70:
+            learning_insights.append("POSITIVE: Win rate is strong. Current strategy is working well.")
+        
+        # Confidence level analysis
+        if stats.get('high_conf_win_rate', 0) < stats.get('low_conf_win_rate', 0):
+            learning_insights.append("WARNING: High confidence signals performing worse than low confidence. Review confidence calibration.")
+        
+        # Recent performance patterns
+        recent_outcomes = [s.get('outcome') for s in recent_signals]
+        recent_losses = recent_outcomes.count('loss') + recent_outcomes.count('losing')
+        if recent_losses > 6:  # More than 60% recent losses
+            learning_insights.append("ALERT: High recent loss rate detected. Consider more conservative approach.")
+        
+        prompt_addition = f"""
+=== PERFORMANCE LEARNING SYSTEM ===
+Historical Performance Statistics:
+- Total Signals Analyzed: {stats['total_signals']}
+- Overall Win Rate: {stats['win_rate']}%
+- Average Win: {stats['average_win']}%
+- Average Loss: {stats['average_loss']}%
+- Profit Factor: {stats['profit_factor']}
+
+Confidence Level Performance:
+- High Confidence (80%+): {stats['high_conf_win_rate']}% win rate ({stats['high_confidence_signals']} signals)
+- Medium Confidence (60-79%): {stats['med_conf_win_rate']}% win rate ({stats['medium_confidence_signals']} signals)
+- Low Confidence (<60%): {stats['low_conf_win_rate']}% win rate ({stats['low_confidence_signals']} signals)
+
+Learning Insights:
+{chr(10).join(['- ' + insight for insight in learning_insights])}
+
+Recent Signal Outcomes (Last 10):
+{chr(10).join([f"- {s.get('original_signal', {}).get('symbol', 'N/A')}: {s.get('outcome', 'N/A')} ({s.get('profit_loss_pct', 0):+.1f}%)" for s in recent_signals[:5]])}
+
+ADAPTATION INSTRUCTIONS:
+Based on the performance data above, adjust your signal generation to improve future outcomes. 
+Pay special attention to the confidence calibration and recent performance patterns.
+"""
+        
+        return prompt_addition
+
+def create_example_signals_file():
+    """
+    Create an example signals_log.json file with sample data
+    """
+    example_signals = [
+        {
+            "Signal": "Buy",
+            "Entry Price": "95000.00",
+            "Take Profit Targets": ["98000.00", "101000.00"],
+            "Stop Loss": "92000.00",
+            "Confidence": 85,
+            "Scenario": "Breakout",
+            "Trade Setup Type": "Momentum",
+            "Reasoning": "Strong bullish momentum with multiple confluences. RSI showing strength, MACD bullish crossover, and price breaking above key resistance at $94,500.",
+            "Relevant News Headlines": ["Bitcoin ETF inflows reach new highs", "Major institutional adoption announced"],
+            "timestamp": "2024-12-15T10:30:00.000000",
+            "symbol": "BTCUSDT"
+        },
+        {
+            "Signal": "Sell",
+            "Entry Price": "3800.00",
+            "Take Profit Targets": ["3600.00", "3400.00"],
+            "Stop Loss": "3950.00",
+            "Confidence": 72,
+            "Scenario": "Reversal",
+            "Trade Setup Type": "Mean Reversion",
+            "Reasoning": "Overbought conditions with bearish divergence on RSI. Price rejected at key resistance level with declining volume.",
+            "Relevant News Headlines": ["Ethereum network congestion concerns", "DeFi protocol exploit reported"],
+            "timestamp": "2024-12-15T11:45:00.000000",
+            "symbol": "ETHUSDT"
+        },
+        {
+            "Signal": "Hold",
+            "Entry Price": "N/A",
+            "Take Profit Targets": [],
+            "Stop Loss": "N/A",
+            "Confidence": 60,
+            "Scenario": "Range-Bound",
+            "Trade Setup Type": "Other",
+            "Reasoning": "Mixed signals with no clear directional bias. Price consolidating in narrow range with low volatility. Wait for clearer setup.",
+            "Relevant News Headlines": ["Solana ecosystem updates", "Mixed market sentiment prevails"],
+            "timestamp": "2024-12-15T12:15:00.000000",
+            "symbol": "SOLUSDT"
+        },
+        {
+            "Signal": "Buy",
+            "Entry Price": "96500.00",
+            "Take Profit Targets": ["99000.00"],
+            "Stop Loss": "94000.00",
+            "Confidence": 91,
+            "Scenario": "Trend Continuation",
+            "Trade Setup Type": "Swing",
+            "Reasoning": "Perfect trend continuation setup. Price pulled back to 20 EMA support, bullish flag pattern completion, high volume confirmation.",
+            "Relevant News Headlines": ["Bitcoin mining hashrate hits new ATH", "Central bank digital currency developments"],
+            "timestamp": "2024-12-15T14:20:00.000000",
+            "symbol": "BTCUSDT"
+        }
+    ]
+    
+    with open('signals_log.json', 'w') as f:
+        json.dump(example_signals, f, indent=2)
+    
+    print("Created example signals_log.json file with sample data")
+
+# Example usage and integration
+if __name__ == "__main__":
+    # Create example signals file if it doesn't exist
+    try:
+        with open('signals_log.json', 'r') as f:
+            pass
+    except FileNotFoundError:
+        create_example_signals_file()
+    
+    # Initialize learning system
+    learning_system = TradingLearningSystem()
+    
+    # Update performance for all signals
+    print("Updating signal performance...")
+    learning_system.update_signal_performance()
+    
+    # Get performance statistics
+    stats = learning_system.get_performance_statistics()
+    print("\nPerformance Statistics:")
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    
+    # Generate learning prompt addition
+    learning_prompt = learning_system.generate_learning_prompt_addition()
+    print("\nLearning Prompt Addition:")
+    print(learning_prompt)
 
 # -------------------- Market Data --------------------
 def fetch_ohlcv(symbol='BTCUSDT', interval='1h', limit=250):
@@ -65,7 +453,7 @@ def analyze_liquidity_zones(order_book, depth=20):
     }
 
 #-------------------- Diagnostic --------------------
-def print_status(name, series):
+# def print_status(name, series):
     if series is None:
         print(f"❌ {name} NOT CALCULATED (series is None)")
         return
@@ -80,34 +468,34 @@ def print_status(name, series):
 # -------------------- Indicators --------------------
 def compute_indicators(df):
     df['rsi'] = ta.rsi(df['close'], length=14)  # RSI
-    print_status("RSI", df['rsi'])
+    # print_status("RSI", df['rsi'])
 
     macd = ta.macd(df['close'])  # MACD
     df = pd.concat([df, macd], axis=1)
     # MACD can be multiple columns (macd, macdsignal, macdhist), check if any column is valid
-    if macd is None or macd.isnull().all().all() or (macd == 0).all().all():
-        print("❌ MACD NOT CALCULATED")
-    else:
-        print("✅ MACD CALCULATED")
+    # if macd is None or macd.isnull().all().all() or (macd == 0).all().all():
+    #    print("❌ MACD NOT CALCULATED")
+    # else:
+    #    print("✅ MACD CALCULATED")
 
     df['ema_20'] = ta.ema(df['close'], length=20)  # EMA20
-    print_status("EMA20", df['ema_20'])
+    # print_status("EMA20", df['ema_20'])
 
     df['ema_50'] = ta.ema(df['close'], length=50)  # EMA50
-    print_status("EMA50", df['ema_50'])
+    # print_status("EMA50", df['ema_50'])
 
     df['ema_200'] = ta.ema(df['close'], length=200)  # EMA200
-    print_status("EMA200", df['ema_200'])
+    # print_status("EMA200", df['ema_200'])
 
     bbands = ta.bbands(df['close'], length=20, std=2)  # Bollinger Bands
     df = pd.concat([df, bbands], axis=1)
-    if bbands is None or bbands.isnull().all().all() or (bbands == 0).all().all():
-        print("❌ BOLLINGER BANDS NOT CALCULATED")
-    else:
-        print("✅ BOLLINGER BANDS CALCULATED")
+    # if bbands is None or bbands.isnull().all().all() or (bbands == 0).all().all():
+    #     print("❌ BOLLINGER BANDS NOT CALCULATED")
+    # else:
+    #     print("✅ BOLLINGER BANDS CALCULATED")
 
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)  # ATR
-    print_status("ATR", df['atr'])
+    # print_status("ATR", df['atr'])
 
     ichimoku = ta.ichimoku(df['high'], df['low'], df['close'])
     if isinstance(ichimoku, tuple) and all(isinstance(i, pd.DataFrame) for i in ichimoku):
@@ -115,20 +503,20 @@ def compute_indicators(df):
         df = df.join(ichimoku_df)
         # For simplicity check one ichimoku component for validity:
         first_comp = ichimoku_df.iloc[:, 0]
-        print_status("ICHIMOKU", first_comp)
-    else:
-        print("❌ ICHIMOKU NOT CALCULATED")
+    #     print_status("ICHIMOKU", first_comp)
+    # else:
+    #     print("❌ ICHIMOKU NOT CALCULATED")
 
     df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])  # VWAP
-    print_status("VWAP", df['vwap'])
+    # print_status("VWAP", df['vwap'])
 
     adx = ta.adx(df['high'], df['low'], df['close'])  # ADX
     df = pd.concat([df, adx], axis=1)
     # Check if ADX column exists and valid
-    if 'ADX_14' in df.columns:
-        print_status("ADX", df['ADX_14'])
-    else:
-        print("❌ ADX NOT CALCULATED")
+    # if 'ADX_14' in df.columns:
+    #     print_status("ADX", df['ADX_14'])
+    # else:
+    #     print("❌ ADX NOT CALCULATED")
 
     return df
 
@@ -145,10 +533,10 @@ def calculate_ema(prices, period):
             emas.append(ema)
 
     # Check if any valid EMA calculated (non-zero)
-    if all(e == 0 or e is None for e in emas):
-        print(f"❌ EMA{period} NOT CALCULATED (custom)")
-    else:
-        print(f"✅ EMA{period} CALCULATED (custom)")
+    # if all(e == 0 or e is None for e in emas):
+    #     print(f"❌ EMA{period} NOT CALCULATED (custom)")
+    # else:
+    #     print(f"✅ EMA{period} CALCULATED (custom)")
 
     return emas
 
@@ -175,10 +563,10 @@ def calculate_atr(highs, lows, closes, period=14):
             atr = (atrs[-1] * (period - 1) + trs[i]) / period
             atrs.append(atr)
 
-    if all(a == 0 or a is None for a in atrs):
-        print(f"❌ ATR NOT CALCULATED (custom, period={period})")
-    else:
-        print(f"✅ ATR CALCULATED (custom, period={period})")
+    # if all(a == 0 or a is None for a in atrs):
+    #    print(f"❌ ATR NOT CALCULATED (custom, period={period})")
+    # else:
+    #    print(f"✅ ATR CALCULATED (custom, period={period})")
 
     return atrs
 
@@ -329,118 +717,154 @@ def run_ollama(prompt, model):
     # Save raw response for debugging
     with open('ollama_raw_response.txt', 'w', encoding='utf-8') as f:
         f.write(response)
-    
-    # Try to find JSON content
-    try:
-        json_start = response.index('{')
-        json_part = response[json_start:]
-        
-        # Find the last closing brace
-        brace_count = 0
-        json_end = -1
-        for i, char in enumerate(json_part):
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    json_end = i + 1
-                    break
-        
-        if json_end > 0:
-            json_part = json_part[:json_end]
-        else:
-            # If we can't find proper closing, try to add one
-            if not json_part.strip().endswith('}'):
-                json_part += '}'
-        
-        return json.loads(json_part)
-        
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f"⚠️ JSON parsing failed: {e}")
-        print(f"Raw response saved to ollama_raw_response.txt")
-        
-        # Try to parse the text response and extract key information
-        try:
-            signal = "Hold"
-            entry_price = "N/A"
-            stop_loss = "N/A"
-            take_profit = []
-            confidence = 50
-            scenario = "Uncertain"
-            setup_type = "Other"
-            reasoning = "Model returned text instead of JSON"
-            
-            # Extract signal type
-            response_lower = response.lower()
-            if "sell" in response_lower or "short" in response_lower:
-                signal = "Sell"
-            elif "buy" in response_lower or "long" in response_lower:
-                signal = "Buy"
-            
-            # Extract prices using regex
-            import re
-            price_pattern = r'\$(\d+(?:\.\d{2})?)'
-            prices = re.findall(price_pattern, response)
-            
-            if len(prices) >= 3:
-                entry_price = prices[0]
-                stop_loss = prices[1] 
-                take_profit = [prices[2]]
-            
-            # Extract confidence if mentioned
-            conf_match = re.search(r'(\d+)%', response)
-            if conf_match:
-                confidence = int(conf_match.group(1))
-            
-            # Extract scenario
-            if "trend continuation" in response_lower:
-                scenario = "Trend Continuation"
-            elif "reversal" in response_lower:
-                scenario = "Reversal"
-            elif "breakout" in response_lower:
-                scenario = "Breakout"
-            elif "range" in response_lower:
-                scenario = "Range-Bound"
-                
-            # Extract setup type
-            if "momentum" in response_lower:
-                setup_type = "Momentum"
-            elif "mean reversion" in response_lower:
-                setup_type = "Mean Reversion"
-            elif "swing" in response_lower:
-                setup_type = "Swing"
-            elif "scalping" in response_lower:
-                setup_type = "Scalping"
-            
-            return {
-                "Signal": signal,
-                "Entry Price": entry_price,
-                "Take Profit Targets": take_profit,
-                "Stop Loss": stop_loss,
-                "Confidence": confidence,
-                "Scenario": scenario,
-                "Trade Setup Type": setup_type,
-                "Reasoning": f"Parsed from text response: {reasoning}",
-                "Relevant News Headlines": ["JD Vance comments on stablecoins", "Crypto market structure discussion"]
-            }
-            
-        except Exception as parse_error:
-            print(f"⚠️ Text parsing also failed: {parse_error}")
-            # Final fallback
-            return {
-                "Signal": "Hold",
-                "Entry Price": "N/A",
-                "Take Profit Targets": [],
-                "Stop Loss": "N/A",
-                "Confidence": 50,
-                "Scenario": "Uncertain",
-                "Trade Setup Type": "Other",
-                "Reasoning": f"Both JSON and text parsing failed. Raw response: {response[:200]}...",
-                "Relevant News Headlines": ["Unable to parse model response"]
-            }
 
-# -------------------- News Analysis --------------------
+def run_claude(prompt, api_key):
+    """
+    Run Claude Sonnet 4 via Anthropic API instead of Ollama
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+    
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            temperature=0.1,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        response_text = response.content[0].text
+        
+        # Save raw response for debugging
+        with open('claude_raw_response.txt', 'w', encoding='utf-8') as f:
+            f.write(response_text)
+        
+        # Try to find JSON content
+        try:
+            json_start = response_text.index('{')
+            json_part = response_text[json_start:]
+            
+            # Find the last closing brace
+            brace_count = 0
+            json_end = -1
+            for i, char in enumerate(json_part):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+            
+            if json_end > 0:
+                json_part = json_part[:json_end]
+            else:
+                # If we can't find proper closing, try to add one
+                if not json_part.strip().endswith('}'):
+                    json_part += '}'
+            
+            return json.loads(json_part)
+            
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"⚠️ JSON parsing failed: {e}")
+            print(f"Raw response saved to claude_raw_response.txt")
+            
+            # Try to parse the text response and extract key information
+            try:
+                signal = "Hold"
+                entry_price = "N/A"
+                stop_loss = "N/A"
+                take_profit = []
+                confidence = 50
+                scenario = "Uncertain"
+                setup_type = "Other"
+                reasoning = "Model returned text instead of JSON"
+                
+                # Extract signal type
+                response_lower = response_text.lower()
+                if "sell" in response_lower or "short" in response_lower:
+                    signal = "Sell"
+                elif "buy" in response_lower or "long" in response_lower:
+                    signal = "Buy"
+                
+                # Extract prices using regex
+                import re
+                price_pattern = r'\$(\d+(?:\.\d{2})?)'
+                prices = re.findall(price_pattern, response_text)
+                
+                if len(prices) >= 3:
+                    entry_price = prices[0]
+                    stop_loss = prices[1] 
+                    take_profit = [prices[2]]
+                
+                # Extract confidence if mentioned
+                conf_match = re.search(r'(\d+)%', response_text)
+                if conf_match:
+                    confidence = int(conf_match.group(1))
+                
+                # Extract scenario
+                if "trend continuation" in response_lower:
+                    scenario = "Trend Continuation"
+                elif "reversal" in response_lower:
+                    scenario = "Reversal"
+                elif "breakout" in response_lower:
+                    scenario = "Breakout"
+                elif "range" in response_lower:
+                    scenario = "Range-Bound"
+                    
+                # Extract setup type
+                if "momentum" in response_lower:
+                    setup_type = "Momentum"
+                elif "mean reversion" in response_lower:
+                    setup_type = "Mean Reversion"
+                elif "swing" in response_lower:
+                    setup_type = "Swing"
+                elif "scalping" in response_lower:
+                    setup_type = "Scalping"
+                
+                return {
+                    "Signal": signal,
+                    "Entry Price": entry_price,
+                    "Take Profit Targets": take_profit,
+                    "Stop Loss": stop_loss,
+                    "Confidence": confidence,
+                    "Scenario": scenario,
+                    "Trade Setup Type": setup_type,
+                    "Reasoning": f"Parsed from text response: {reasoning}",
+                    "Relevant News Headlines": ["Unable to parse structured response"]
+                }
+                
+            except Exception as parse_error:
+                print(f"⚠️ Text parsing also failed: {parse_error}")
+                # Final fallback
+                return {
+                    "Signal": "Hold",
+                    "Entry Price": "N/A",
+                    "Take Profit Targets": [],
+                    "Stop Loss": "N/A",
+                    "Confidence": 50,
+                    "Scenario": "Uncertain",
+                    "Trade Setup Type": "Other",
+                    "Reasoning": f"Both JSON and text parsing failed. Raw response: {response_text[:200]}...",
+                    "Relevant News Headlines": ["Unable to parse model response"]
+                }
+                
+    except Exception as e:
+        print(f"⚠️ Claude API error: {e}")
+        return {
+            "Signal": "Hold",
+            "Entry Price": "N/A",
+            "Take Profit Targets": [],
+            "Stop Loss": "N/A",
+            "Confidence": 50,
+            "Scenario": "API Error",
+            "Trade Setup Type": "Other",
+            "Reasoning": f"Claude API error: {str(e)}",
+            "Relevant News Headlines": ["API connection failed"]
+        }
+
+# -------------------- News Analysis (FIXED) --------------------
 def analyze_news_with_llama(news_articles):
     summaries = []
     unsafe_keywords = [
@@ -449,8 +873,25 @@ def analyze_news_with_llama(news_articles):
     ]
 
     for article in news_articles:
-        content = article.get('title', '') + ' ' + article.get('description', '')
-        prompt = f"""
+        try:
+            # Safely get article content
+            title = article.get('title', '') if article else ''
+            description = article.get('description', '') if article else ''
+            
+            # Skip if no meaningful content
+            if not title and not description:
+                print(f"⚠️ Skipping article due to empty content")
+                continue
+                
+            content = title + ' ' + description
+            
+            # Check for unsafe content before processing
+            content_lower = content.lower()
+            if any(word in content_lower for word in unsafe_keywords):
+                print(f"⚠️ Skipping article due to flagged content: {title[:50]}...")
+                continue
+
+            prompt = f"""
 You are a seasoned financial analyst. Read the following crypto news article and reply ONLY in JSON format.
 
 Article:
@@ -463,25 +904,59 @@ Reply in this format only:
   "reason": "<short reason for sentiment>"
 }}
 """
-        try:
+            
+            # Get response from Ollama
             response = run_ollama(prompt, 'llama3.2:3b')
-            text_content = json.dumps(response).lower()
-            if any(word in text_content for word in unsafe_keywords):
-                print(f"⚠️ Skipping article due to flagged content: {article.get('title')}")
+            
+            # Check if response is None or empty
+            if response is None:
+                print(f"⚠️ Skipping article due to None response from Ollama: {title[:50]}...")
+                continue
+                
+            # Check if response is a dictionary (expected)
+            if not isinstance(response, dict):
+                print(f"⚠️ Skipping article due to unexpected response type: {type(response)}")
+                continue
+            
+            # Additional safety check for response content
+            response_text = json.dumps(response).lower()
+            if any(word in response_text for word in unsafe_keywords):
+                print(f"⚠️ Skipping article due to flagged content in response: {title[:50]}...")
                 continue
 
+            # Safely extract fields with defaults
+            summary = response.get('summary', 'No summary available')
+            sentiment = response.get('sentiment', 'Neutral')
+            reason = response.get('reason', 'No reason provided')
+            
+            # Validate sentiment value
+            valid_sentiments = ['positive', 'neutral', 'negative']
+            if sentiment.lower() not in valid_sentiments:
+                sentiment = 'Neutral'
+            
             summaries.append({
-                'title': article.get('title', ''),
-                'summary': response.get('summary', ''),
-                'sentiment': response.get('sentiment', ''),
-                'reason': response.get('reason', '')
+                'title': title,
+                'summary': summary,
+                'sentiment': sentiment,
+                'reason': reason
             })
+            
         except Exception as e:
-            print(f"⚠️ Skipping article due to error: {e}")
+            # More detailed error logging
+            article_title = article.get('title', 'Unknown title') if article else 'No article data'
+            print(f"⚠️ Skipping article '{article_title[:50]}...' due to error: {str(e)}")
             continue
 
-    return summaries
+    # If no summaries were generated, provide a default
+    if not summaries:
+        summaries.append({
+            'title': 'No news processed',
+            'summary': 'No cryptocurrency news articles were successfully processed',
+            'sentiment': 'Neutral',
+            'reason': 'No valid articles available for analysis'
+        })
 
+    return summaries
 
 # -------------------- Enhanced Signal Analysis --------------------
 def calculate_signal_confluence(indicators, mtf_data, trend_info, liquidity):
@@ -587,7 +1062,7 @@ def calculate_risk_reward_metrics(indicators, liquidity, atr_multiplier=2):
     }
 
 # -------------------- Signal Generation --------------------
-def generate_trade_signal(df, df_1h, news_summaries, metrics, liquidity, volume_profile, multi_df, trend_info):
+def generate_trade_signal(df, df_1h, news_summaries, metrics, liquidity, volume_profile, multi_df, trend_info, api_key):
     latest_data = df.iloc[-1].to_dict()
     indicators = {
         'RSI': latest_data.get('rsi'),
@@ -633,24 +1108,27 @@ def generate_trade_signal(df, df_1h, news_summaries, metrics, liquidity, volume_
     confluence_analysis = calculate_signal_confluence(indicators, mtf_data, trend_info, liquidity)
     risk_metrics = calculate_risk_reward_metrics(indicators, liquidity)
 
+    # Self learning system integration
+    learning_system = TradingLearningSystem()
+    learning_system.update_signal_performance()
+    learning_addition = learning_system.generate_learning_prompt_addition()
+
     # News sentiment analysis
     bullish_news = sum(1 for news in news_summaries if news.get('sentiment', '').lower() == 'positive')
     bearish_news = sum(1 for news in news_summaries if news.get('sentiment', '').lower() == 'negative')
     news_bias = 'BULLISH' if bullish_news > bearish_news else 'BEARISH' if bearish_news > bullish_news else 'NEUTRAL'
-
     news_input = '\n'.join([f"{item['title']}: {item['summary']}" for item in news_summaries])
+    
     prompt = f"""
-You are an elite institutional crypto trader with 10+ years experience managing portfolios. Your track record includes 78% win rate with average 3.2:1 R/R ratio.
+YOU are an elite institutional crypto trader with 10+ years experience. Your track record includes 78% win rate with average 3.2:1 R/R ratio.
 
 CRITICAL INSTRUCTIONS:
 1. Analyze ALL data points systematically
 2. Provide SPECIFIC entry, SL, and TP levels based on technical confluence
-3. Calculate position size recommendations
-4. Evaluate the confluence of signals.
-5. Identify the scenario type: Breakout, Reversal, Trend Continuation, or Range-Bound.
-6. Assess market regime and adapt strategy accordingly
-7. Generate actionable signals with institutional-grade precision
-8. Generate a clear trade signal only in structured JSON format.
+3. Evaluate the confluence of signals.
+4. Identify the scenario type: Breakout, Reversal, Trend Continuation, or Range-Bound.
+5. Assess market regime and adapt strategy accordingly
+6. Generate a clear trade signal institutional-grade precision, only in structured JSON format.
 
 === CURRENT MARKET DATA ===
 Symbol: {latest_data.get('symbol', 'CRYPTO')}
@@ -708,13 +1186,6 @@ ADDITIONAL CONTEXT FOR DECISION MAKING:
 - Volatility is {trend_info.get('volatility', 'unknown').upper()}
 - Order flow shows {'BID' if liquidity.get('bid_ask_imbalance_pct', 0) > 0 else 'ASK'} dominance
 - Multi-timeframe alignment is {'STRONG' if abs(confluence_analysis.get('confluence_score', 0)) > 30 else 'WEAK'}
-- News sentiment is {news_bias}
-
-RISK MANAGEMENT REQUIREMENTS:
-- Never risk more than 2% of portfolio per trade
-- Minimum R/R ratio of 1.5:1 required for entry
-- Must have clear invalidation level
-- Position sizing based on ATR and account size
 
 SIGNAL QUALITY STANDARDS:
 - confidence (80-95%): Multiple confluences, clear trend, low risk
@@ -725,6 +1196,16 @@ SIGNAL QUALITY STANDARDS:
 News Bias: {news_bias}
 Bullish Articles: {bullish_news} | Bearish Articles: {bearish_news} | Total: {len(news_summaries)}
 Key Headlines: {' | '.join([f"{news.get('title', '')[:50]}..." for news in news_summaries[:3]])}
+
+{learning_addition}
+Based on the performance learning data above, generate your signal with improved accuracy.
+
+VALIDATION CHECK: Before responding, verify your signal follows these rules.
+CRITICAL TRADING RULES - NEVER VIOLATE:
+🔴 BUY Signals: Take Profit > Entry Price > Stop Loss
+🔴 SELL Signals: Stop Loss > Entry Price > Take Profit  
+🔴 Entry prices must be realistic 
+
 
 === TRADING DIRECTIVE ===
 Based on the comprehensive analysis above, provide your institutional-grade trading recommendation ONLY in the following JSON format:
@@ -741,12 +1222,13 @@ Based on the comprehensive analysis above, provide your institutional-grade trad
 - Relevant News Headlines (summarize 2-3 most impactful)
 }}
 
-Respond ONLY with the JSON format specified above. No additional text or explanations outside the JSON structure.
+IMPORTANT:
+Do NOT output any text, explanations, reasoning steps, or comments outside the JSON.  
 """
-    return run_ollama(prompt, 'qwen3:8b')
+    return run_claude(prompt, api_key)
 
 # -------------------- File Save --------------------
-def save_signal_to_file(signal, symbol, filename='signals_log.json'):
+def save_signal_to_file(signal, symbol, filename='signals_claude_log.json'):
     signal['timestamp'] = datetime.utcnow().isoformat()
     signal['symbol'] = symbol
     try:
@@ -761,6 +1243,7 @@ def save_signal_to_file(signal, symbol, filename='signals_log.json'):
 # -------------------- Discord Notification --------------------
 def send_discord_notification(webhook_url, signal_data):
     signal_type = signal_data['Signal'].lower()
+
     image_url = {
         'buy': "https://i.imgur.com/UPEAkWm.png",
         'hold': "https://i.imgur.com/20UDHex.png"
@@ -769,6 +1252,34 @@ def send_discord_notification(webhook_url, signal_data):
         'buy': 0x00FF00,
         'hold': 0x7289DA
     }.get(signal_type, 0xFF0000)
+
+        # Fix the news headlines formatting
+    news_headlines = signal_data.get('Relevant News Headlines', [])
+    
+    # Ensure it's a list, not a string
+    if isinstance(news_headlines, str):
+        # If it's a string, split by common delimiters or wrap in a list
+        if news_headlines.strip():
+            news_headlines = [news_headlines]
+        else:
+            news_headlines = ["No significant news headlines available for analysis"]
+    elif not news_headlines or (isinstance(news_headlines, list) and len(news_headlines) == 0):
+        news_headlines = ["No significant news headlines available for analysis"]
+    
+    # Format the headlines properly
+    formatted_headlines = []
+    for headline in news_headlines:
+        if isinstance(headline, str) and headline.strip():
+            # Limit headline length to prevent Discord embed limits
+            truncated_headline = headline[:100] + "..." if len(headline) > 100 else headline
+            formatted_headlines.append(f"• {truncated_headline}")
+    
+    # If no valid headlines after processing
+    if not formatted_headlines:
+        formatted_headlines = ["• No significant news headlines available for analysis"]
+    
+    # Join the headlines with newlines
+    headlines_text = '\n'.join(formatted_headlines)
 
     fields = [
         {"name": "Symbol", "value": signal_data['symbol'], "inline": True},
@@ -784,7 +1295,7 @@ def send_discord_notification(webhook_url, signal_data):
         # Add Trade Setup Type
         *([] if signal_type == 'hold' else [{"name": "Trade Setup Type", "value": signal_data.get('Trade Setup Type', 'N/A'), "inline": True}]),
         {"name": "Reasoning", "value": signal_data['Reasoning'], "inline": False},
-        {"name": "🚨 Relevant News Headlines", "value": '\n'.join([f"\u2022 {headline}" for headline in signal_data['Relevant News Headlines']]), "inline": False}
+        {"name": "🚨 Relevant News Headlines", "value": headlines_text, "inline": False}
     ]
 
     embed = {
@@ -803,6 +1314,7 @@ def send_discord_notification(webhook_url, signal_data):
 if __name__ == "__main__":
     start_time = datetime.utcnow()
     NEWS_API_KEY = '33aea78f5a054aea8827002fa0ecdbca'
+    ANTHROPIC_API_KEY = 'test'
     DISCORD_WEBHOOK_URL = 'https://ptb.discord.com/api/webhooks/1375475186626859040/6kIQy-YoU-ZcydVgi9USedoPucu8cfnpT0cHwktMfAvl25X-TSvzCuENQsnb9KL5Hm2X'
 
     market_metrics = fetch_market_cap_and_volume()
@@ -831,10 +1343,11 @@ if __name__ == "__main__":
         liquidity=liquidity_zones,
         volume_profile=volume_profile,
         multi_df=multi_df,
-        trend_info=trend_info
+        trend_info=trend_info,
+        api_key=ANTHROPIC_API_KEY  
     )
 
-        save_signal_to_file(signal, symbol)
-        send_discord_notification(DISCORD_WEBHOOK_URL, signal)
+    save_signal_to_file(signal, symbol)
+    send_discord_notification(DISCORD_WEBHOOK_URL, signal)
 
-    print("Start time (UTC minute):", start_time.strftime("%Y-%m-%d %H:%M"))
+print("Start time (UTC minute):", start_time.strftime("%Y-%m-%d %H:%M"))
